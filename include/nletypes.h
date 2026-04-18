@@ -132,6 +132,15 @@ typedef struct nle_settings {
     /* Initial seeds for the RNGs */
     nle_seeds_init_t initial_seeds;
 
+    /*
+     * If true and seeds are set, derive deterministic time values
+     * (moon phase, friday 13th, night, midnight) from the seed
+     * instead of using real system time.
+     */
+    bool fix_moon_phase;
+    unsigned long time_seed;
+    bool time_seed_is_set;
+
 } nle_settings;
 
 #endif /* NLETYPES_H */
