@@ -163,6 +163,7 @@ OBSERVATION_KEYS: tuple[str, ...] = (
 )
 
 SCORE_CAP = 10_000.0
+GRID_CROP_PADDING = 1
 
 _HUNGER = {
     0: "Satiated",
@@ -215,6 +216,24 @@ class GlyphbenchNLEObservation:
     time: int
 
 
+@dataclass(frozen=True, slots=True)
+class GridViewport:
+    y0: int
+    x0: int
+    y1: int
+    x1: int
+    full_height: int
+    full_width: int
+
+    @property
+    def height(self) -> int:
+        return self.y1 - self.y0
+
+    @property
+    def width(self) -> int:
+        return self.x1 - self.x0
+
+
 class GlyphbenchNetHack:
     """Small adapter around a seedable full-action NetHack environment."""
 
@@ -239,6 +258,7 @@ class GlyphbenchNetHack:
             fix_moon_phase=True,
         )
         self._score_progress = 0.0
+        self._best_score = 0
         self._last_obs: dict[str, np.ndarray] | None = None
 
     @property
@@ -253,7 +273,8 @@ class GlyphbenchNetHack:
         self._env.seed(core=core, disp=disp, reseed=False, lgen=lgen)
         obs, info = self._env.reset()
         self._last_obs = obs
-        self._score_progress = self._progress_from_obs(obs)
+        self._best_score = self._score_from_obs(obs)
+        self._score_progress = self._progress_from_score(self._best_score)
         return self._render(obs), {
             **dict(info),
             "nle_core_seed": core,
@@ -266,7 +287,9 @@ class GlyphbenchNetHack:
     ) -> tuple[GlyphbenchNLEObservation, float, bool, bool, dict[str, Any]]:
         obs, raw_reward, terminated, truncated, info = self._env.step(int(action_index))
         self._last_obs = obs
-        progress = self._progress_from_obs(obs)
+        raw_score = self._score_from_obs(obs)
+        self._best_score = max(self._best_score, raw_score)
+        progress = self._progress_from_score(raw_score)
         reward = max(0.0, progress - self._score_progress)
         self._score_progress = max(self._score_progress, progress)
 
@@ -275,14 +298,15 @@ class GlyphbenchNetHack:
                 reward = 1.0 - self._score_progress
                 self._score_progress = 1.0
             else:
-                reward = -1.0 - self._score_progress
-                self._score_progress = -1.0
+                reward = -1.0
 
         blstats = obs["blstats"]
         info = {
             **dict(info),
             "nle_raw_reward": float(raw_reward),
-            "score": int(blstats[nethack.NLE_BL_SCORE]),
+            "score": int(self._best_score),
+            "nethack_score": int(self._best_score),
+            "nethack_blstats_score": int(blstats[nethack.NLE_BL_SCORE]),
             "hp": int(blstats[nethack.NLE_BL_HP]),
             "time": int(blstats[nethack.NLE_BL_TIME]),
             "normalized_score_progress": float(self._score_progress),
@@ -292,18 +316,26 @@ class GlyphbenchNetHack:
     def close(self) -> None:
         self._env.close()
 
-    def _progress_from_obs(self, obs: dict[str, np.ndarray]) -> float:
+    def _score_from_obs(self, obs: dict[str, np.ndarray]) -> int:
         score = int(obs["blstats"][nethack.NLE_BL_SCORE])
+        return max(score, 0)
+
+    def _progress_from_score(self, score: int) -> float:
         if self.score_cap <= 0:
             return 0.0
-        return min(max(score, 0) / self.score_cap, 1.0)
+        return min(max(int(score), 0) / self.score_cap, 1.0)
 
     def _render(self, obs: dict[str, np.ndarray]) -> GlyphbenchNLEObservation:
         blstats = obs["blstats"]
+        viewport = _grid_viewport(obs["chars"])
         return GlyphbenchNLEObservation(
-            grid=_render_grid(obs["chars"]),
-            legend=_render_legend(obs["chars"], obs["screen_descriptions"]),
-            hud=_render_hud(blstats, obs["inv_strs"], obs["inv_letters"]),
+            grid=_render_grid(obs["chars"], viewport),
+            legend=_render_legend(
+                obs["chars"], obs["screen_descriptions"], viewport
+            ),
+            hud=_render_hud(
+                blstats, obs["inv_strs"], obs["inv_letters"], viewport, obs["chars"]
+            ),
             message=_render_message(obs["message"], obs["tty_chars"]),
             score=int(blstats[nethack.NLE_BL_SCORE]),
             hp=int(blstats[nethack.NLE_BL_HP]),
@@ -311,9 +343,23 @@ class GlyphbenchNetHack:
         )
 
 
-def _render_grid(chars: np.ndarray) -> str:
+def _grid_viewport(chars: np.ndarray) -> GridViewport:
+    height, width = int(chars.shape[0]), int(chars.shape[1])
+    visible = (chars != 0) & (chars != ord(" "))
+    ys, xs = np.nonzero(visible)
+    if len(ys) == 0 or len(xs) == 0:
+        return GridViewport(0, 0, min(height, 1), min(width, 1), height, width)
+
+    y0 = max(0, int(ys.min()) - GRID_CROP_PADDING)
+    y1 = min(height, int(ys.max()) + GRID_CROP_PADDING + 1)
+    x0 = max(0, int(xs.min()) - GRID_CROP_PADDING)
+    x1 = min(width, int(xs.max()) + GRID_CROP_PADDING + 1)
+    return GridViewport(y0, x0, y1, x1, height, width)
+
+
+def _render_grid(chars: np.ndarray, viewport: GridViewport) -> str:
     rows: list[str] = []
-    for row in chars:
+    for row in chars[viewport.y0 : viewport.y1, viewport.x0 : viewport.x1]:
         rows.append("".join(chr(int(c)) if int(c) != 0 else " " for c in row))
     return "\n".join(rows)
 
@@ -328,10 +374,14 @@ def _decode_c_string(row: np.ndarray) -> str:
     return bytes(values).decode("latin-1", errors="replace").strip()
 
 
-def _render_legend(chars: np.ndarray, screen_descriptions: np.ndarray) -> str:
+def _render_legend(
+    chars: np.ndarray,
+    screen_descriptions: np.ndarray,
+    viewport: GridViewport,
+) -> str:
     meanings: dict[str, list[str]] = {}
-    for y in range(chars.shape[0]):
-        for x in range(chars.shape[1]):
+    for y in range(viewport.y0, viewport.y1):
+        for x in range(viewport.x0, viewport.x1):
             ch = chr(int(chars[y, x])) if int(chars[y, x]) != 0 else " "
             desc = _decode_c_string(screen_descriptions[y, x])
             if not desc:
@@ -356,14 +406,18 @@ def _render_hud(
     blstats: np.ndarray,
     inv_strs: np.ndarray,
     inv_letters: np.ndarray,
+    viewport: GridViewport,
+    chars: np.ndarray,
 ) -> str:
     inventory = _render_inventory(inv_strs, inv_letters)
     conditions = [
         label for mask, label in _CONDITION_MASKS if int(blstats[25]) & mask
     ]
     condition = " ".join(conditions) if conditions else "None"
+    grid_view = _render_grid_viewport(viewport, chars)
     return "\n".join(
         (
+            grid_view,
             f"HP: {int(blstats[10])}/{int(blstats[11])}    "
             f"Pw: {int(blstats[14])}/{int(blstats[15])}    "
             f"AC: {int(blstats[16])}    "
@@ -384,6 +438,34 @@ def _render_hud(
             f"Inventory: {inventory if inventory else '(empty)'}",
         )
     )
+
+
+def _render_grid_viewport(viewport: GridViewport, chars: np.ndarray) -> str:
+    player = _find_in_viewport(chars, viewport, "@")
+    player_text = (
+        f"@ local row {player[0]}, col {player[1]}"
+        if player is not None
+        else "@ not visible"
+    )
+    return (
+        "Grid view: terminal rows "
+        f"{viewport.y0}-{viewport.y1 - 1}, cols {viewport.x0}-{viewport.x1 - 1} "
+        f"of {viewport.full_height}x{viewport.full_width}; "
+        f"{viewport.height}x{viewport.width} crop; {player_text}"
+    )
+
+
+def _find_in_viewport(
+    chars: np.ndarray,
+    viewport: GridViewport,
+    target: str,
+) -> tuple[int, int] | None:
+    target_code = ord(target)
+    cropped = chars[viewport.y0 : viewport.y1, viewport.x0 : viewport.x1]
+    ys, xs = np.nonzero(cropped == target_code)
+    if len(ys) == 0 or len(xs) == 0:
+        return None
+    return int(ys[0]), int(xs[0])
 
 
 def _render_inventory(inv_strs: np.ndarray, inv_letters: np.ndarray) -> str:
