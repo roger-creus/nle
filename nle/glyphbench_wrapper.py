@@ -9,6 +9,7 @@ standard NLE observation tensors.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from typing import Any
 
@@ -164,6 +165,7 @@ OBSERVATION_KEYS: tuple[str, ...] = (
 
 SCORE_CAP = 10_000.0
 GRID_CROP_PADDING = 1
+_TOP_TEN_SCORE_RE = re.compile(r"^\s*\d+\s+(\d+)\s+Agent-", re.MULTILINE)
 
 _HUNGER = {
     0: "Satiated",
@@ -242,9 +244,9 @@ class GlyphbenchNetHack:
         *,
         max_episode_steps: int = 100_000,
         character: str = "@",
-        score_cap: float = SCORE_CAP,
+        score_cap: float | None = None,
     ) -> None:
-        self.score_cap = float(score_cap)
+        del score_cap  # kept for compatibility with older callers
         self._env = NetHackScore(
             actions=ACTION_ENUMS,
             character=character,
@@ -257,7 +259,6 @@ class GlyphbenchNetHack:
             observation_keys=OBSERVATION_KEYS,
             fix_moon_phase=True,
         )
-        self._score_progress = 0.0
         self._best_score = 0
         self._last_obs: dict[str, np.ndarray] | None = None
 
@@ -274,7 +275,6 @@ class GlyphbenchNetHack:
         obs, info = self._env.reset()
         self._last_obs = obs
         self._best_score = self._score_from_obs(obs)
-        self._score_progress = self._progress_from_score(self._best_score)
         return self._render(obs), {
             **dict(info),
             "nle_core_seed": core,
@@ -285,33 +285,33 @@ class GlyphbenchNetHack:
     def step(
         self, action_index: int
     ) -> tuple[GlyphbenchNLEObservation, float, bool, bool, dict[str, Any]]:
-        obs, raw_reward, terminated, truncated, info = self._env.step(int(action_index))
+        obs, nle_task_reward, terminated, truncated, info = self._env.step(
+            int(action_index)
+        )
         self._last_obs = obs
+        rendered = self._render(obs)
         raw_score = self._score_from_obs(obs)
+        terminal_score = _terminal_score_from_message(rendered.message)
+        if terminal_score is not None:
+            raw_score = max(raw_score, terminal_score)
+        previous_score = self._best_score
         self._best_score = max(self._best_score, raw_score)
-        progress = self._progress_from_score(raw_score)
-        reward = max(0.0, progress - self._score_progress)
-        self._score_progress = max(self._score_progress, progress)
-
-        if terminated:
-            if bool(info.get("is_ascended", False)):
-                reward = 1.0 - self._score_progress
-                self._score_progress = 1.0
-            else:
-                reward = -1.0
+        reward = float(self._best_score - previous_score)
 
         blstats = obs["blstats"]
         info = {
             **dict(info),
-            "nle_raw_reward": float(raw_reward),
+            "nle_raw_reward": float(nle_task_reward),
+            "nle_task_reward": float(nle_task_reward),
+            "raw_score_delta": reward,
             "score": int(self._best_score),
             "nethack_score": int(self._best_score),
             "nethack_blstats_score": int(blstats[nethack.NLE_BL_SCORE]),
+            "nethack_terminal_score": terminal_score,
             "hp": int(blstats[nethack.NLE_BL_HP]),
             "time": int(blstats[nethack.NLE_BL_TIME]),
-            "normalized_score_progress": float(self._score_progress),
         }
-        return self._render(obs), float(reward), bool(terminated), bool(truncated), info
+        return rendered, float(reward), bool(terminated), bool(truncated), info
 
     def close(self) -> None:
         self._env.close()
@@ -319,11 +319,6 @@ class GlyphbenchNetHack:
     def _score_from_obs(self, obs: dict[str, np.ndarray]) -> int:
         score = int(obs["blstats"][nethack.NLE_BL_SCORE])
         return max(score, 0)
-
-    def _progress_from_score(self, score: int) -> float:
-        if self.score_cap <= 0:
-            return 0.0
-        return min(max(int(score), 0) / self.score_cap, 1.0)
 
     def _render(self, obs: dict[str, np.ndarray]) -> GlyphbenchNLEObservation:
         blstats = obs["blstats"]
@@ -486,6 +481,13 @@ def _render_message(message: np.ndarray, tty_chars: np.ndarray) -> str:
     if tty and raw_message and raw_message not in tty:
         return f"{raw_message}\n{tty}"
     return tty or raw_message
+
+
+def _terminal_score_from_message(message: str) -> int | None:
+    match = _TOP_TEN_SCORE_RE.search(message)
+    if match is None:
+        return None
+    return int(match.group(1))
 
 
 def _trim_tty_line(line: str) -> str:
